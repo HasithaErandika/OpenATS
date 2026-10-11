@@ -13,8 +13,10 @@ import {
 import { scoringService } from "../scoring/scoring.service";
 import { cleanObject as clean } from "../../utils/object.utils";
 import * as gcal from "../../shared/services/google-calendar.service";
-import { mailService } from "../../shared/services/mail.service";
+import { interviewCancelledEmail, interviewInviteEmail } from "../../shared/services/candidate-emails";
+import { emailContext, sendCandidateEmail } from "../../shared/services/candidate-mailer";
 import logger from "../../utils/logger";
+import { DEFAULT_INTERVIEW_MINUTES } from "./interview-confirm";
 import { getErrorMessage } from "../../utils/error.utils";
 
 /** A scorecard that cannot be saved because of what was submitted, not because of a fault. */
@@ -96,8 +98,8 @@ export const interviewService = {
 
     if (!interview) throw new Error("Failed to create interview");
 
-    // Sync to Google Calendar (service account — always available)
-    if (interview.scheduledAt && interview.durationMinutes) {
+    // Add it to the shared company calendar, when one is set up
+    if (gcal.isSharedCalendarConfigured() && interview.scheduledAt && interview.durationMinutes) {
       try {
         const eventId = await gcal.createCalendarEvent({
           interviewId: interview.id,
@@ -125,34 +127,30 @@ export const interviewService = {
       }
     }
 
-    // Send interview invitation email to the candidate
+    // Tell the candidate. Not awaited: the interview is saved either way.
     if (interview.scheduledAt && interview.durationMinutes) {
-      // try {
-      //   await mailService.sendInterviewInviteEmail(
-      //     row.email,
-      //     `${row.firstName} ${row.lastName}`,
-      //     row.jobTitle ?? "",
-      //     row.stageName ?? "",
-      //     interview.scheduledAt.toISOString(),
-      //     interview.durationMinutes,
-      //   );
-      // } catch (err) {
-      //   logger.error(`Failed to send interview email: ${getErrorMessage(err)}`);
-      // }
-      if (interview.scheduledAt && interview.durationMinutes) {
-        mailService
-          .sendInterviewInviteEmail(
-            row.email,
-            `${row.firstName} ${row.lastName}`,
-            row.jobTitle ?? "",
-            row.stageName ?? "",
-            interview.scheduledAt.toISOString(),
-            interview.durationMinutes,
-          )
-          .catch((err: unknown) => {
-            logger.error(`Failed to send interview email: ${getErrorMessage(err)}`);
-          });
-      }
+      const scheduledAt = interview.scheduledAt;
+      const durationMinutes = interview.durationMinutes;
+      void emailContext("interview_invite")
+        .then((context) =>
+          sendCandidateEmail({
+            candidateId: input.candidateId,
+            to: row.email,
+            kind: "interview_invite",
+            sentBy: createdBy,
+            ...interviewInviteEmail({
+              ...context,
+              candidateName: `${row.firstName} ${row.lastName}`,
+              jobTitle: row.jobTitle ?? "",
+              stageName: row.stageName ?? "",
+              scheduledAt,
+              durationMinutes,
+            }),
+          }),
+        )
+        .catch((err: unknown) => {
+          logger.error(`Failed to send interview email: ${getErrorMessage(err)}`);
+        });
     }
 
     return interview;
@@ -311,7 +309,31 @@ export const interviewService = {
 
     if (!updated) return null;
 
-    // Sync to Google Calendar (service account — always available)
+    // Keep the entry in the interviewer's own calendar in step with a new time
+    if (updated.providerMeetingId && updated.interviewerId && updated.scheduledAt) {
+      try {
+        const { integrationConnectionService } = await import(
+          "../../shared/integrations/connection.service"
+        );
+        const { getProviderClient } = await import("../../shared/integrations/registry");
+        const accessToken = await integrationConnectionService.getValidAccessToken(updated.interviewerId);
+        if (accessToken) {
+          await getProviderClient(updated.meetingProvider ?? "google_meet").updateMeeting(
+            accessToken,
+            updated.providerMeetingId,
+            {
+              eventName: updated.eventName ?? "Interview",
+              scheduledAt: updated.scheduledAt,
+              durationMinutes: updated.durationMinutes ?? DEFAULT_INTERVIEW_MINUTES,
+            },
+          );
+        }
+      } catch (err) {
+        logger.error(`Failed to update the calendar entry for interview ${id}: ${getErrorMessage(err)}`);
+      }
+    }
+
+    // Same for an entry in the shared company calendar
     if (updated.googleEventId) {
       try {
         const [row] = await db
@@ -521,12 +543,8 @@ export const interviewService = {
       .where(eq(candidateInterviews.id, id));
     if (!existing) return null;
 
-    // Cancel the Meet event on the interviewer's calendar so attendees are notified
-    if (
-      existing.providerMeetingId &&
-      existing.meetingProvider &&
-      existing.interviewerId
-    ) {
+    // Cancel the entry in the interviewer's calendar so attendees are notified
+    if (existing.providerMeetingId && existing.interviewerId) {
       try {
         const { integrationConnectionService } = await import(
           "../../shared/integrations/connection.service"
@@ -537,7 +555,7 @@ export const interviewService = {
             existing.interviewerId,
           );
         if (accessToken) {
-          await getProviderClient(existing.meetingProvider).deleteMeeting(
+          await getProviderClient(existing.meetingProvider ?? "google_meet").deleteMeeting(
             accessToken,
             existing.providerMeetingId,
           );
@@ -580,12 +598,20 @@ export const interviewService = {
         .from(candidates)
         .where(eq(candidates.id, existing.candidateId));
       if (candidate) {
-        mailService
-          .sendInterviewCancellationEmail(
-            candidate.email,
-            `${candidate.firstName} ${candidate.lastName}`,
-            existing.eventName,
-            existing.scheduledAt,
+        const eventName = existing.eventName;
+        void emailContext("interview_cancelled")
+          .then((context) =>
+            sendCandidateEmail({
+              candidateId: existing.candidateId,
+              to: candidate.email,
+              kind: "interview_cancelled",
+              ...interviewCancelledEmail({
+                ...context,
+                candidateName: `${candidate.firstName} ${candidate.lastName}`,
+                eventName,
+                scheduledAt: existing.scheduledAt,
+              }),
+            }),
           )
           .catch((err: unknown) => {
             logger.error(

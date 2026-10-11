@@ -1,4 +1,5 @@
 import { ContentBlock, TemplateBody } from "../../db/schema/templates";
+import { escapeHtml } from "../../shared/services/email-layout";
 
 export interface TemplateContext {
   candidate_name?: string;
@@ -20,6 +21,24 @@ export const templateEngineService = {
       const value = context[variable.trim()];
       return value !== undefined ? String(value) : match;
     });
+  },
+
+  /** The {{variables}} used in a template that the context has no value for. */
+  missingVariables(subject: string, body: TemplateBody, context: TemplateContext): string[] {
+    const texts = [
+      subject,
+      ...(typeof body === "string"
+        ? [body]
+        : body.map((block) => ("content" in block && typeof block.content === "string" ? block.content : ""))),
+    ];
+    const missing = new Set<string>();
+    for (const text of texts) {
+      for (const match of text.matchAll(/\{\{(.+?)\}\}/g)) {
+        const name = match[1]!.trim();
+        if (context[name] === undefined) missing.add(name);
+      }
+    }
+    return [...missing];
   },
 
   renderJSON(body: TemplateBody, context: TemplateContext): TemplateBody {
@@ -53,7 +72,12 @@ export const templateEngineService = {
 
   renderHTML(body: TemplateBody, context: TemplateContext): string {
     if (typeof body === "string") {
-      return this.replaceVariables(body, context);
+      // The body is HTML, and some values were typed by the candidate, so they are escaped.
+      const escaped: TemplateContext = {};
+      for (const [key, value] of Object.entries(context)) {
+        escaped[key] = value === undefined ? undefined : escapeHtml(String(value));
+      }
+      return this.replaceVariables(body, escaped);
     }
 
     const processedBlocks = this.renderJSON(body, context) as ContentBlock[];

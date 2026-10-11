@@ -246,6 +246,20 @@
       "when": 1791639938889,
       "tag": "0034_curious_redwing",
       "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1791723906035,
+      "tag": "0035_ambitious_wraith",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1791724653621,
+      "tag": "0036_same_redwing",
+      "breakpoints": true
     }
   ]
 }

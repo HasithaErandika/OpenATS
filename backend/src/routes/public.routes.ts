@@ -22,14 +22,11 @@ import {
   getPublicOfferByToken,
 } from "../modules/offer/offer.controller";
 import { db } from "../db";
-import { candidates, jobs, candidateInterviews, users } from "../db/schema";
+import { candidates, jobs, candidateInterviews } from "../db/schema";
 import { and, eq, ne } from "drizzle-orm";
 import rateLimit from "express-rate-limit";
 import logger from "../utils/logger";
-import { mailService } from "../shared/services/mail.service";
-import { socketService } from "../shared/services/socket.service";
-import { integrationConnectionService } from "../shared/integrations/connection.service";
-import { getProviderClient } from "../shared/integrations/registry";
+import { completeInterviewBooking } from "../modules/interview/interview-confirm";
 import { getErrorMessage } from "../utils/error.utils";
 
 const router: Router = Router();
@@ -86,6 +83,32 @@ const publicWriteLimiter = rateLimit({
   message: { error: "Too many requests. Please try again later." },
 });
 
+/**
+ * Assessments are limited per link, not per IP address, so candidates sharing an office
+ * network do not use up each other's allowance. Saving answers has its own, larger budget:
+ * an answer is saved each time one is picked, and those saves must never be able to use up
+ * the requests needed to start or to submit.
+ */
+const assessmentKey = (req: Request) => `assessment:${String(req.params.token ?? "")}`;
+
+const assessmentAnswerLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 600,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: assessmentKey,
+  message: { error: "Too many requests. Please try again later." },
+});
+
+const assessmentActionLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: assessmentKey,
+  message: { error: "Too many requests. Please try again later." },
+});
+
 const publicReadLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
@@ -109,15 +132,15 @@ router.post(
 
 // assessments for candidates ( token based)
 router.get("/assessment/:token", publicReadLimiter, getAssessmentForCandidate);
-router.post("/assessment/:token/start", publicWriteLimiter, startAssessment);
+router.post("/assessment/:token/start", assessmentActionLimiter, startAssessment);
 router.post(
   "/assessment/:token/answer",
-  publicWriteLimiter,
+  assessmentAnswerLimiter,
   submitAssessmentAnswer,
 );
 router.post(
   "/assessment/:token/complete",
-  publicWriteLimiter,
+  assessmentActionLimiter,
   completeAssessment,
 );
 
@@ -168,6 +191,7 @@ router.get("/interview/:token", publicReadLimiter, async (req, res) => {
         eventType: candidateInterviews.eventType,
         meetingUrl: candidateInterviews.meetingUrl,
         bodyText: candidateInterviews.bodyText,
+        durationMinutes: candidateInterviews.durationMinutes,
         timeSlots: candidateInterviews.timeSlots,
         status: candidateInterviews.status,
         tokenExpiresAt: candidateInterviews.tokenExpiresAt,
@@ -318,121 +342,7 @@ router.patch(
         return;
       }
 
-      const [candidate] = await db
-        .select({
-          email: candidates.email,
-          firstName: candidates.firstName,
-          lastName: candidates.lastName,
-        })
-        .from(candidates)
-        .where(eq(candidates.id, iv.candidateId));
-
-      const interviewer = iv.interviewerId
-        ? (
-            await db
-              .select({ email: users.email })
-              .from(users)
-              .where(eq(users.id, iv.interviewerId))
-          )[0]
-        : undefined;
-
-      let meetingUrl = iv.meetingUrl;
-      let providerMeetingId: string | null = null;
-      if (iv.meetingProvider && iv.interviewerId) {
-        try {
-          const accessToken =
-            await integrationConnectionService.getValidAccessToken(
-              iv.interviewerId,
-            );
-          if (accessToken) {
-            const meeting = await getProviderClient(
-              iv.meetingProvider,
-            ).createMeeting(accessToken, {
-              eventName: iv.eventName ?? "Interview",
-              scheduledAt,
-              durationMinutes: 60,
-              attendeeEmails: candidate ? [candidate.email] : [],
-            });
-            meetingUrl = meeting.meetingUrl;
-            providerMeetingId = meeting.providerMeetingId ?? null;
-          } else {
-            logger.warn(
-              `Interview ${iv.id}: interviewer ${iv.interviewerId} no longer has a valid ${iv.meetingProvider} connection — confirmation will go out without an auto-generated link`,
-            );
-          }
-        } catch (err) {
-          // Non-fatal — keep whatever meetingUrl was already on the row (manual or none)
-          logger.error(
-            `Failed to auto-generate meeting link for interview ${iv.id}: ${getErrorMessage(err)}`,
-          );
-        }
-      }
-      if ((iv.eventType ?? "virtual") === "virtual" && !meetingUrl) {
-        logger.warn(
-          `Interview ${iv.id} confirmed as virtual but has no meeting link — recruiter attention needed`,
-        );
-      }
-
-      let googleEventId: string | null = null;
-      if (candidate && iv.eventName) {
-        try {
-          const gcal = await import("../shared/services/google-calendar.service");
-          googleEventId = await gcal.createCalendarEvent({
-            interviewId: iv.id,
-            candidateName: `${candidate.firstName} ${candidate.lastName}`,
-            jobTitle: "",
-            stageName: "",
-            scheduledAt,
-            durationMinutes: 60,
-            notes: iv.bodyText ?? null,
-            attendeeEmails: [
-              candidate.email,
-              ...(interviewer ? [interviewer.email] : []),
-            ],
-            meetingUrl,
-          });
-        } catch (err) {
-          logger.error(
-            `Failed to create calendar event for interview ${iv.id}: ${getErrorMessage(err)}`,
-          );
-        }
-      }
-
-      if (meetingUrl !== iv.meetingUrl || googleEventId || providerMeetingId) {
-        await db
-          .update(candidateInterviews)
-          .set({
-            meetingUrl,
-            ...(googleEventId ? { googleEventId } : {}),
-            ...(providerMeetingId ? { providerMeetingId } : {}),
-            updatedAt: new Date(),
-          })
-          .where(eq(candidateInterviews.id, iv.id));
-      }
-
-      if (candidate && iv.eventName) {
-        mailService
-          .sendInterviewConfirmationEmail(
-            candidate.email,
-            `${candidate.firstName} ${candidate.lastName}`,
-            iv.eventName,
-            iv.eventType ?? "virtual",
-            scheduledAt,
-            60,
-            meetingUrl,
-            iv.location ?? null,
-          )
-          .catch((err: unknown) => {
-            logger.error(
-              `Failed to send confirmation email for interview ${iv.id}: ${getErrorMessage(err)}`,
-            );
-          });
-      }
-
-      socketService.notifyInterviewChanged({
-        interviewId: iv.id,
-        candidateId: iv.candidateId,
-      });
+      await completeInterviewBooking(iv, scheduledAt);
 
       res.status(200).json({ data: { confirmed: true, slot: selectedSlot } });
     } catch (e) {
