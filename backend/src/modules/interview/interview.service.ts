@@ -12,8 +12,7 @@ import {
 } from "../../db/schema";
 import { scoringService } from "../scoring/scoring.service";
 import { cleanObject as clean } from "../../utils/object.utils";
-import * as gcal from "../../shared/services/google-calendar.service";
-import { interviewCancelledEmail, interviewInviteEmail } from "../../shared/services/candidate-emails";
+import { interviewCancelledEmail } from "../../shared/services/candidate-emails";
 import { emailContext, sendCandidateEmail } from "../../shared/services/candidate-mailer";
 import logger from "../../utils/logger";
 import { DEFAULT_INTERVIEW_MINUTES } from "./interview-confirm";
@@ -25,18 +24,6 @@ export class FeedbackValidationError extends Error {
     super(message);
     this.name = "FeedbackValidationError";
   }
-}
-
-export interface CreateInterviewInput {
-  candidateId: number;
-  stageId?: number;
-  scheduledAt?: string | null;
-  durationMinutes?: number | null;
-  notes?: string | null;
-  /** Emails of interviewers to invite (Google Calendar guests) */
-  attendeeEmails?: string[];
-  /** The user conducting the interview — whose connected provider (if any) generates the meeting link */
-  interviewerId: number;
 }
 
 export interface UpdateInterviewInput {
@@ -56,106 +43,6 @@ export interface UpdateInterviewInput {
 }
 
 export const interviewService = {
-  /** Create an interview. If Google Calendar is connected, creates event. */
-  async create(input: CreateInterviewInput, createdBy: number | null = null) {
-    // Look up candidate info — also get current stage as fallback
-    const [row] = await db
-      .select({
-        jobId: candidates.jobId,
-        firstName: candidates.firstName,
-        lastName: candidates.lastName,
-        email: candidates.email,
-        currentStageId: candidates.currentStageId,
-        jobTitle: jobs.title,
-        stageName: jobPipelineStages.name,
-      })
-      .from(candidates)
-      .leftJoin(jobs, eq(candidates.jobId, jobs.id))
-      .leftJoin(
-        jobPipelineStages,
-        eq(jobPipelineStages.id, input.stageId || candidates.currentStageId),
-      )
-      .where(eq(candidates.id, input.candidateId));
-
-    if (!row) throw new Error("Candidate not found");
-
-    // Use provided stageId, or fall back to candidate's current stage
-    const resolvedStageId = input.stageId || row.currentStageId || 0;
-
-    const [interview] = await db
-      .insert(candidateInterviews)
-      .values({
-        candidateId: input.candidateId,
-        stageId: resolvedStageId,
-        jobId: row.jobId,
-        scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null,
-        durationMinutes: input.durationMinutes ?? 30,
-        notes: input.notes ?? null,
-        interviewerId: input.interviewerId,
-        createdBy,
-      })
-      .returning();
-
-    if (!interview) throw new Error("Failed to create interview");
-
-    // Add it to the shared company calendar, when one is set up
-    if (gcal.isSharedCalendarConfigured() && interview.scheduledAt && interview.durationMinutes) {
-      try {
-        const eventId = await gcal.createCalendarEvent({
-          interviewId: interview.id,
-          candidateName: `${row.firstName} ${row.lastName}`,
-          jobTitle: row.jobTitle ?? "",
-          stageName: row.stageName ?? "",
-          scheduledAt: interview.scheduledAt,
-          durationMinutes: interview.durationMinutes,
-          notes: interview.notes,
-          attendeeEmails: input.attendeeEmails ?? [],
-        });
-
-        // Save Google event ID on the interview record
-        await db
-          .update(candidateInterviews)
-          .set({ googleEventId: eventId })
-          .where(eq(candidateInterviews.id, interview.id));
-
-        interview.googleEventId = eventId;
-      } catch (err) {
-        // Don't fail the interview creation just because calendar sync failed
-        logger.error(
-          `Failed to sync interview ${interview.id} to Google Calendar: ${getErrorMessage(err)}`,
-        );
-      }
-    }
-
-    // Tell the candidate. Not awaited: the interview is saved either way.
-    if (interview.scheduledAt && interview.durationMinutes) {
-      const scheduledAt = interview.scheduledAt;
-      const durationMinutes = interview.durationMinutes;
-      void emailContext("interview_invite")
-        .then((context) =>
-          sendCandidateEmail({
-            candidateId: input.candidateId,
-            to: row.email,
-            kind: "interview_invite",
-            sentBy: createdBy,
-            ...interviewInviteEmail({
-              ...context,
-              candidateName: `${row.firstName} ${row.lastName}`,
-              jobTitle: row.jobTitle ?? "",
-              stageName: row.stageName ?? "",
-              scheduledAt,
-              durationMinutes,
-            }),
-          }),
-        )
-        .catch((err: unknown) => {
-          logger.error(`Failed to send interview email: ${getErrorMessage(err)}`);
-        });
-    }
-
-    return interview;
-  },
-
   async getByCandidateAndStage(candidateId: number, stageId: number) {
     return db
       .select()
@@ -330,44 +217,6 @@ export const interviewService = {
         }
       } catch (err) {
         logger.error(`Failed to update the calendar entry for interview ${id}: ${getErrorMessage(err)}`);
-      }
-    }
-
-    // Same for an entry in the shared company calendar
-    if (updated.googleEventId) {
-      try {
-        const [row] = await db
-          .select({
-            firstName: candidates.firstName,
-            lastName: candidates.lastName,
-            jobTitle: jobs.title,
-            stageName: jobPipelineStages.name,
-          })
-          .from(candidates)
-          .leftJoin(jobs, eq(candidates.jobId, jobs.id))
-          .leftJoin(
-            jobPipelineStages,
-            eq(jobPipelineStages.id, updated.stageId),
-          )
-          .where(eq(candidates.id, updated.candidateId));
-
-        if (row && updated.scheduledAt && updated.durationMinutes) {
-          await gcal.updateCalendarEvent(updated.googleEventId, {
-            interviewId: updated.id,
-            candidateName: `${row.firstName} ${row.lastName}`,
-            jobTitle: row.jobTitle ?? "",
-            stageName: row.stageName ?? "",
-            scheduledAt: updated.scheduledAt,
-            durationMinutes: updated.durationMinutes,
-            notes: updated.notes,
-            attendeeEmails: input.attendeeEmails ?? [],
-            meetingUrl: updated.meetingUrl,
-          });
-        }
-      } catch (err) {
-        logger.error(
-          `Failed to sync interview ${id} to Google Calendar: ${getErrorMessage(err)}`,
-        );
       }
     }
 
@@ -567,17 +416,6 @@ export const interviewService = {
       } catch (err) {
         logger.error(
           `Failed to cancel provider meeting for interview ${id}: ${getErrorMessage(err)}`,
-        );
-      }
-    }
-
-    // Delete Google Calendar event if synced (sendUpdates:all notifies attendees)
-    if (existing.googleEventId) {
-      try {
-        await gcal.deleteCalendarEvent(existing.googleEventId);
-      } catch (err) {
-        logger.error(
-          `Failed to delete calendar event for interview ${id}: ${getErrorMessage(err)}`,
         );
       }
     }

@@ -32,4 +32,16 @@ Things to check:
 - **Run the database migrations** before starting a new version. They live in `backend/` and include the sign-in tables.
 - **Create the first admin** with `make admin` after the first deployment.
 
+## Google Calendar and Google Meet (optional)
+
+Interviews work without Google. With these settings in `backend/.env`, each interviewer can connect their own Google account, so their interviews go in their calendar and can get a Google Meet link. What the connection does is described in [Interviews and feedback](../using-openats/interviews#google-calendar-and-google-meet).
+
+| Variable | Notes |
+| --- | --- |
+| `GOOGLE_OAUTH_CLIENT_ID` | From an OAuth client of type "Web application" in Google Cloud, in a project with the Google Calendar API enabled. |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | The secret of the same client. |
+| `GOOGLE_OAUTH_REDIRECT_URI` | The API's public address followed by `/oauth/google/callback`. It must be listed as an authorised redirect URI on the client. |
+
+Once these are set, each person connects their own account under **Settings → Integrations**.
+
 Coming from a version that used WSO2 Asgardeo? Follow [Upgrading to built-in sign-in](./upgrading-to-built-in-auth).
