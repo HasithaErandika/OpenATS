@@ -32,6 +32,7 @@ import { CvSheet } from "./_components/cv-sheet";
 import { AssessmentSheet } from "./_components/assessment-sheet";
 import { AiAnalysisSection } from "./_components/sections/ai-analysis-section";
 import { AnswersSection } from "./_components/sections/answer-section";
+import { CvTextSection } from "./_components/sections/cv-text-section";
 import { HistorySection } from "./_components/sections/history-section";
 import { OfferSection } from "./_components/sections/offer-section";
 import { InterviewsSection } from "./_components/sections/interviews-section";
@@ -79,8 +80,8 @@ export default function CandidateDetailPage({
   const deleteMutation = useDeleteCandidate();
   const updateMutation = useUpdateCandidateBasicDetails();
 
-  // The AI analysis tab exists only while AI CV analysis is turned on in Settings. When it is off
-  // the tab is not listed at all, and the page opens on the next one.
+  // The page opens on the first tab, the CV summary. The AI analysis tab exists only while AI CV
+  // analysis is turned on in Settings; when it is off the tab is not listed at all.
   const { data: aiSettingsData, isLoading: aiSettingsLoading } = useAiSettings();
   const aiActive = aiSettingsData?.data?.active ?? false;
   const sections = useMemo(
@@ -273,6 +274,9 @@ export default function CandidateDetailPage({
               )}
               {activeSection === "answers" && (
                 <AnswersSection candidate={candidate} />
+              )}
+              {activeSection === "cv-text" && (
+                <CvTextSection cvText={candidate.cvText ?? null} hasResume={!!candidate.resumeUrl} />
               )}
               {activeSection === "history" && (
                 <HistorySection candidate={candidate} stageMap={stageMap} />

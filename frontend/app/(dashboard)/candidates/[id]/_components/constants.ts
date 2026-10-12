@@ -9,6 +9,7 @@ import {
   UserRemove01Icon,
   Mail01Icon,
   Quiz03Icon,
+  TextAlignLeftIcon,
 } from "@hugeicons/core-free-icons";
 
 export function timeAgo(dateStr: string) {
@@ -83,6 +84,7 @@ export const REJECTION_REASONS = [
 export type SectionId =
   | "ai-analysis"
   | "answers"
+  | "cv-text"
   | "history"
   | "offer"
   | "interviews"
@@ -91,6 +93,7 @@ export type SectionId =
   | "scores";
 
 export const SECTIONS = [
+  { id: "cv-text" as SectionId, label: "CV Summary", icon: TextAlignLeftIcon },
   // Listed only while AI CV analysis is turned on in Settings; see the candidate page.
   { id: "ai-analysis" as SectionId, label: "AI analysis", icon: AiScanTextIcon },
   { id: "answers" as SectionId, label: "Answers", icon: QuestionIcon },

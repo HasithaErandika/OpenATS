@@ -10,7 +10,7 @@ import {
 import { jobService } from "../job/job.service";
 import { r2Service } from "../../shared/services/r2.service";
 import { socketService } from "../../shared/services/socket.service";
-import { parseMinScore } from "./candidate-query";
+import { parseMinScore, parseMinYears } from "./candidate-query";
 import { aiSettingsService } from "../settings/ai-settings.service";
 import { scoringService } from "../scoring/scoring.service";
 import { withholdInterviewScores } from "../scoring/scoring";
@@ -18,6 +18,8 @@ import { canAccessCandidate } from "../../shared/auth/job-access";
 import logger from "../../utils/logger";
 
 import { requestCvAnalysis } from "../../queues/cv-analysis/queue";
+import { requestCvExtraction } from "../../queues/cv-extract/queue";
+import { cvTextService } from "./cv-text.service";
 import { getErrorMessage} from "../../utils/error.utils";
 
 const customAnswerSchema = z.object({
@@ -114,6 +116,14 @@ export const applyForJob = async (req: Request, res: Response) => {
     );
 
     if (result.resumeUrl) {
+      requestCvExtraction({
+        candidateId: result.id,
+        resumeUrl: result.resumeUrl,
+      }).catch((err) =>
+        logger.error(
+          `Failed to enqueue CV text extraction for candidateId=${result.id}: ${getErrorMessage(err)}`,
+        ),
+      );
       requestCvAnalysis({
         candidateId: result.id,
         jobId: result.jobId,
@@ -207,6 +217,7 @@ export const getCandidates = async (req: Request, res: Response) => {
         ? (flagParam as CandidateFlagFilter)
         : undefined,
       fullyScored: scoreFiltersAllowed && req.query.fullyScored === "true" ? true : undefined,
+      minExperienceYears: parseMinYears(req.query.minExperience),
       stageId: req.query.stageId
         ? parseInt(req.query.stageId.toString())
         : undefined,
@@ -300,6 +311,44 @@ export const getCandidateById = async (req: Request, res: Response) => {
       `Failed to fetch candidate id=${req.params.id}: ${getErrorMessage(error)}`,
     );
     res.status(500).json({ error: "Failed to fetch candidate" });
+  }
+};
+
+/** The text read from the candidate's CV, for whoever may open the candidate. */
+export const getCandidateCvText = async (req: Request, res: Response) => {
+  try {
+    const id = parseInt((req.params.id ?? "").toString());
+    if (isNaN(id)) {
+      res.status(400).json({ error: "Invalid candidate ID" });
+      return;
+    }
+
+    // The same split as getCandidateById: only an interviewer is limited to their own jobs.
+    if (req.user.role === "interviewer" && !(await canAccessCandidate(req.user, id))) {
+      logger.warn(`[access] user ${req.user.id} denied candidate ${id}`);
+      res.status(403).json({ error: "You do not have access to this resource" });
+      return;
+    }
+
+    const cvText = await cvTextService.getForCandidate(id);
+    if (!cvText) {
+      res.status(404).json({ error: "This candidate has no CV text" });
+      return;
+    }
+    // One section on its own, for a reader that does not need the whole CV.
+    const section = req.query.section?.toString();
+    if (section) {
+      const sections = (cvText.sections ?? []).filter((s) => s.key === section);
+      res.status(200).json({ data: { status: cvText.status, sections } });
+      return;
+    }
+
+    res.status(200).json({ data: cvText });
+  } catch (error) {
+    logger.error(
+      `Failed to fetch CV text for candidate id=${req.params.id} - user ${req.user?.id}: ${getErrorMessage(error)}`,
+    );
+    res.status(500).json({ error: "Failed to fetch CV text" });
   }
 };
 
@@ -577,6 +626,14 @@ export const updateCandidateBasicDetails = async (
     }
 
     if (newResumeUrl) {
+      requestCvExtraction({
+        candidateId: updated.id,
+        resumeUrl: newResumeUrl,
+      }).catch((err) =>
+        logger.error(
+          `Failed to enqueue CV text extraction for candidateId=${updated.id}: ${getErrorMessage(err)}`,
+        ),
+      );
       requestCvAnalysis({
         candidateId: updated.id,
         jobId: updated.jobId,
